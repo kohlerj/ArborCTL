@@ -42,13 +42,38 @@ while { iterations < limits.spindles }
     var commandChange = { global.arborState[iterations][1] }
     var jobRunning    = { job.file.fileName != null && !(state.status == "resuming" || state.status == "pausing" || state.status == "paused") }
 
-    ; Check for unexpected instability
-    if { (var.wasStable && !var.isStable && !var.commandChange) || var.errorDetected }
-        ; Unexpected instability detected - pause job
-        echo { "ArborCtl: Spindle " ^ iterations ^ " became unstable!" }
-        if { var.jobRunning }
-            echo { "ArborCtl: Pausing job" }
-            M25 ; Pause any running job
+    ; Enhanced error handling with communication resilience
+    if { var.errorDetected }
+        ; Get communication health metrics
+        var consecFailures = { global.arborCommHealth[iterations][0] }
+        var isHighRisk = { var.vfdRunning && spindles[iterations].current > 100 }
+        
+        ; Determine response based on failure severity and risk level
+        if { var.consecFailures >= global.arborMaxConsecFailures && var.isHighRisk }
+            ; High risk scenario - persistent communication loss with spindle running
+            echo { "ArborCtl: CRITICAL - Communication lost with spindle " ^ iterations }
+            echo { "ArborCtl: Initiating controlled stop for safety" }
+            M5 P{iterations}
+            
+            if { var.jobRunning }
+                echo { "ArborCtl: Pausing job" }
+                M25
+                M291 R"ArborCtl Communication Error" P{"Spindle " ^ iterations ^ " communication lost. Check RS485 connection and cable routing."} S2
+        elif { var.consecFailures >= global.arborMaxConsecFailures * 2 }
+            ; Extended communication loss even at low risk - stop anyway
+            echo { "ArborCtl: Extended communication loss on spindle " ^ iterations ^ " - stopping" }
+            M5 P{iterations}
+            if { var.jobRunning }
+                M25
+        elif { var.consecFailures > 0 }
+            ; Warning level - operating on cached data
+            echo { "ArborCtl: Spindle " ^ iterations ^ " operating on cached data (" ^ var.consecFailures ^ " consecutive failures)" }
+            echo { "ArborCtl: Check RS485 cable routing, shielding, and termination if this persists" }
+    elif { var.wasStable && !var.isStable && !var.commandChange }
+        ; Check for unexpected instability (but only if no communication errors)
+        echo { "ArborCtl: Spindle " ^ iterations ^ " instability detected" }
+        ; Note: With retry logic, transient read failures are now handled gracefully
+        ; Only genuine instability should trigger this path
 
     ; Get spindle load if available
     var spindleLoad = { global.arborVFDPower[iterations] != null ? global.arborVFDPower[iterations][1] : 0 }

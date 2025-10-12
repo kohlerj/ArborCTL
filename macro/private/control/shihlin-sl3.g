@@ -63,24 +63,90 @@ if { global.arborState[param.S][0] == null }
 
 var shouldRun = { (spindles[param.S].state == "forward" || spindles[param.S].state == "reverse") && spindles[param.S].active > 0 }
 
-; Read status bits, frequency, output data
-; 0 = Status, 1 = Req Freq, 2 = Output Freq, 3 = Output Current,
-; 4 = Output Voltage, 5 = Error 1, 6 = Error 2
-M261.1 P{param.C} A{param.A} F3 R{var.statusAddr} B7 V"spindleState"
-G4 P{var.cmdWait}
+; Read VFD status and power with retry logic and caching
+; Status: 0=Status, 1=Req Freq, 2=Output Freq, 3=Output Current, 4=Output Voltage, 5=Error 1, 6=Error 2
+var readSuccess = false
+var spindleState = null
+var spindlePower = null
+var attempt = 0
+var waitTime = { global.arborModbusTimeout }
 
-; Read output power
-M261.1 P{param.C} A{param.A} F3 R{var.powerAddr} B1 V"spindlePower"
-G4 P{var.cmdWait}
+while { var.attempt < global.arborMaxRetries && !var.readSuccess }
+    set var.attempt = { var.attempt + 1 }
+    
+    ; Attempt Modbus status read
+    M261.1 P{param.C} A{param.A} F3 R{var.statusAddr} B7 V"spindleState"
+    G4 P{var.waitTime}
+    
+    ; Attempt Modbus power read
+    M261.1 P{param.C} A{param.A} F3 R{var.powerAddr} B1 V"spindlePower"
+    G4 P{var.waitTime}
+    
+    ; Validate both responses
+    var statusValid = { var.spindleState != null && #var.spindleState == 7 && var.spindleState[0] >= 0 && var.spindleState[0] < 65536 }
+    var powerValid = { var.spindlePower != null && #var.spindlePower == 1 && var.spindlePower[0] >= 0 && var.spindlePower[0] < 65536 }
+    
+    if { var.statusValid }
+        set var.readSuccess = true
+        if { global.arborCommDebug }
+            echo { "ArborCtl: Spindle " ^ param.S ^ " status read OK (attempt " ^ var.attempt ^ ")" }
+        ; If power read failed but status succeeded, calculate power from V*I
+        if { !var.powerValid }
+            if { global.arborCommDebug }
+                echo { "ArborCtl: Spindle " ^ param.S ^ " power read failed, calculating from V*I" }
+            set var.spindlePower = { vector(1, var.spindleState[3] * var.spindleState[4]) }
+    else
+        if { global.arborCommDebug }
+            echo { "ArborCtl: Spindle " ^ param.S ^ " status read failed (attempt " ^ var.attempt ^ ")" }
+    
+    ; If not successful and retries remain, wait longer before next attempt (exponential backoff)
+    if { !var.readSuccess && var.attempt < global.arborMaxRetries }
+        set var.waitTime = { floor(var.waitTime * 1.5) }
+        G4 P{var.waitTime}
 
-; Make sure we have all the data we need.
-if { var.spindleState == null }
-    M260.1 P{param.C} A{param.A} F6 R{var.statusAddr} B0
-    G4 P{var.cmdWait}
-    M260.1 P{param.C} A{param.A} F6 R{var.freqAddr} B0
-    G4 P{var.cmdWait}
-    M5
-    abort { "ArborCtl: Failed to read spindle state!" }
+; Update communication health tracking
+set global.arborCommHealth[param.S][3] = { global.arborCommHealth[param.S][3] + var.attempt }
+
+if { var.readSuccess }
+    ; Success - reset consecutive failure counter and update cache
+    set global.arborCommHealth[param.S][0] = 0
+    set global.arborCommHealth[param.S][1] = { state.upTime }
+    set global.arborCommHealth[param.S][4] = { var.spindleState }
+    set global.arborCommHealth[param.S][5] = { state.upTime }
+else
+    ; All retries failed - increment consecutive failures
+    set global.arborCommHealth[param.S][0] = { global.arborCommHealth[param.S][0] + 1 }
+    set global.arborCommHealth[param.S][2] = { global.arborCommHealth[param.S][2] + 1 }
+    
+    echo { "ArborCtl: WARNING - Spindle " ^ param.S ^ " communication failed after " ^ var.attempt ^ " attempts" }
+    echo { "ArborCtl: Consecutive failures: " ^ global.arborCommHealth[param.S][0] }
+    
+    ; Decide whether to use cached data or abort
+    var consecFailures = { global.arborCommHealth[param.S][0] }
+    var cacheAge = { state.upTime - global.arborCommHealth[param.S][5] }
+    var cacheValid = { var.cacheAge < global.arborCacheValidityPeriod && global.arborCommHealth[param.S][4] != null }
+    
+    if { var.consecFailures < global.arborMaxConsecFailures && var.cacheValid }
+        ; Use cached data - system continues operating with last known good state
+        set var.spindleState = { global.arborCommHealth[param.S][4] }
+        echo { "ArborCtl: Using cached data (age: " ^ var.cacheAge ^ "s)" }
+        echo { "ArborCtl: If condition persists, check RS485 wiring and termination" }
+    else
+        ; Too many consecutive failures or cache too old - must stop
+        if { var.consecFailures >= global.arborMaxConsecFailures }
+            echo { "ArborCtl: CRITICAL - Communication lost with spindle " ^ param.S }
+            echo { "ArborCtl: " ^ var.consecFailures ^ " consecutive failures detected" }
+        else
+            echo { "ArborCtl: Cache expired (age: " ^ var.cacheAge ^ "s, max: " ^ global.arborCacheValidityPeriod ^ "s)" }
+        
+        ; Stop spindle and set error state - daemon will handle the response
+        M260.1 P{param.C} A{param.A} F6 R{var.statusAddr} B0
+        G4 P{var.cmdWait}
+        M260.1 P{param.C} A{param.A} F6 R{var.freqAddr} B0
+        G4 P{var.cmdWait}
+        M5 P{param.S}
+        set global.arborState[param.S][4] = true
+        M99
 
 ; Check if VFD is in emergency stop
 if { var.spindleState[0] == 128 }

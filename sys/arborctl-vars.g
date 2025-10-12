@@ -36,3 +36,28 @@ global arborVFDStatus = { vector(limits.spindles, null) }
 ; VFD power variables - all in one vector
 ; [0]: current power consumption in watts, [1]: load as percentage of rated power
 global arborVFDPower = { vector(limits.spindles, null) }
+
+; Communication health tracking - indexed by spindle number
+; [0]: consecutive_failures (count of failures in a row)
+; [1]: last_success_timestamp (seconds from uptime)
+; [2]: total_failures (lifetime counter for diagnostics)
+; [3]: total_attempts (lifetime counter for diagnostics)
+; [4]: cached_status (last known good VFD status array)
+; [5]: cached_timestamp (when cache was last updated)
+global arborCommHealth = { vector(limits.spindles, { 0, 0, 0, 0, null, 0 }) }
+
+; Communication resilience configuration - tunable parameters
+; Maximum consecutive failures before taking action (default: 3)
+global arborMaxConsecFailures = 3
+
+; Maximum retry attempts per read operation (default: 3)
+global arborMaxRetries = 3
+
+; Base timeout for Modbus read in milliseconds (default: 50)
+global arborModbusTimeout = 50
+
+; Cache validity period in seconds (default: 2.0)
+global arborCacheValidityPeriod = 2.0
+
+; Enable verbose communication logging for debugging (default: false)
+global arborCommDebug = false
